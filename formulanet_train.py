@@ -73,7 +73,8 @@ def main():
         import chainermn
         from chainermn.extensions import create_multi_node_checkpointer
         comm = chainermn.create_communicator()
-        devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
+        #devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
+        devices = [chainer.get_device("cuda:" + str(comm.intra_rank))]
     else:
         devices = list(map(chainer.get_device, args.devices.split(',')))
         if len(devices) == 0:
