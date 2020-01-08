@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 
 # to avoid "_tkinter.TclError: no display name and no $DISPLAY environment variable" error
-import matplotlib as mpl
-
-mpl.use('Agg')
+# import matplotlib as mpl
+# 
+# mpl.use('Agg')
 
 import argparse
 import chainer
@@ -69,7 +69,7 @@ def main():
     if args.chainermn:
         # matplotlib.font_manager should be imported before mpi4py.MPI
         # to avoid MPI issue with fork() system call.
-        import matplotlib.font_manager
+        # import matplotlib.font_manager
         import chainermn
         from chainermn.extensions import create_multi_node_checkpointer
         comm = chainermn.create_communicator()
@@ -150,10 +150,10 @@ def main():
         trainer.extend(extensions.PrintReport(
             ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
              'elapsed_time']))
-        trainer.extend(
-            extensions.PlotReport(['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
-        trainer.extend(extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'], x_key='epoch',
-                                             file_name='accuracy.png'))
+        # trainer.extend(
+        #     extensions.PlotReport(['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
+        # trainer.extend(extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'], x_key='epoch',
+        #                                      file_name='accuracy.png'))
         trainer.extend(extensions.ProgressBar(update_interval=10))
         trainer.extend(extensions.snapshot_object(model, filename='model_epoch-{.updater.epoch}'))
 
