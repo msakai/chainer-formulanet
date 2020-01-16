@@ -7,17 +7,17 @@ mpl.use('Agg')
 
 import argparse
 import chainer
-import chainer.functions as F
-import chainer.links as L
-from chainer import iterators
-from chainer import optimizers
-from chainer import reporter
-from chainer import training
 from chainer.training import extensions
 import h5py
 import numpy as np
 import os
 import sys
+
+import torch
+import torch.nn.functional as F
+import ignite
+import chainer_pytorch_migration as cpm
+import chainer_pytorch_migration.ignite
 
 import formulanet
 import holstep
@@ -29,26 +29,18 @@ sys.setrecursionlimit(10000)
 def main():
     parser = argparse.ArgumentParser(description='chainer formulanet trainer')
 
-    parser.add_argument('--chainermn', action='store_true', help='Use ChainerMN')
     parser.add_argument('--batchsize', '-b', type=int, default=32,
                         help='Number of examples in each mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=5,
                         help='Number of sweeps over the dataset to train')
     parser.add_argument('--devices', type=str, default='',
-                        help='Comma-separated list of devices specifier. '
-                        'Either ChainerX device  specifier or an integer. '
-                        'If non-negative integer, CuPy arrays with specified '
-                        'device id are used. If negative integer, NumPy '
-                        'arrays are used')
+                        help='Comma-separated list of devices specifier.')
     parser.add_argument('--dataset', '-i', default="holstep",
                         help='Directory of holstep repository')
     parser.add_argument('--out', '-o', default='results',
                         help='Directory to output the result')
     parser.add_argument('--resume', '-r', default='',
                         help='Resume the training from snapshot')
-    parser.add_argument('--autoload', action='store_true',
-                        help='Automatically load trainer snapshots in case'
-                        ' of preemption or other temporary system failure')
     #    parser.add_argument('--seed', type=int, default=0,
     #                        help='Random seed')
     #    parser.add_argument('--snapshot_interval', type=int, default=10000,
@@ -59,12 +51,8 @@ def main():
     parser.add_argument('--preserve-order', action='store_true', help='Use order-preserving model')
     parser.add_argument('--steps', type=int, default="3", help='Number of update steps')
 
-    parser.add_argument('--run-id', type=str, default="formulanet_train",
-                        help='ID of the task name')
-    parser.add_argument('--checkpointer-path', type=str, default=None,
-                        help='Path for chainermn.create_multi_node_checkpointer')
-
     args = parser.parse_args()
+    args.chainermn = False
 
     if args.chainermn:
         # matplotlib.font_manager should be imported before mpi4py.MPI
@@ -75,11 +63,15 @@ def main():
         comm = chainermn.create_communicator()
         devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
     else:
-        devices = list(map(chainer.get_device, args.devices.split(',')))
+        if args.devices == '':
+            devices = []
+        else:
+            devices = list(map(torch.device, args.devices.split(',')))
         if len(devices) == 0:
-            devices = [chainer.get_device(-1)]
+            devices = [torch.device("cpu")]
         print('# Devices: {}'.format(",".join(map(str, devices))))
-    devices[0].use()
+    #devices[0].use()
+    device = devices[0]
 
     if not args.chainermn or comm.rank == 0:
         print('# epoch: {}'.format(args.epoch))
@@ -108,69 +100,74 @@ def main():
         train._dataset._h5f = train_h5f
         test._dataset._h5f = test_h5f
 
-    train_iter = iterators.SerialIterator(train, args.batchsize)
-    test_iter = iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train, collate_fn=formulanet.convert, shuffle=True, batch_size=args.batchsize, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test, collate_fn=formulanet.convert, shuffle=False, batch_size=args.batchsize, pin_memory=True)
 
     model = formulanet.FormulaNet(vocab_size=len(symbols.symbols), steps=args.steps,
                                   order_preserving=args.preserve_order, conditional=args.conditional)
+
     if len(devices) == 1:
-        model.to_device(devices[0])
+        model.to(devices[0])
 
     # "We train our networks using RMSProp [47] with 0.001 learning rate and 1 × 10−4 weight decay.
     # We lower the learning rate by 3X after each epoch."
-    if chainer.get_dtype() == np.float16:
-        optimizer = optimizers.RMSprop(lr=0.001, eps=1e-07)
-    else:
-        optimizer = optimizers.RMSprop(lr=0.001)
-    optimizer.setup(model)
-    optimizer.add_hook(chainer.optimizer_hooks.WeightDecay(10 ** (-4)))
-    if args.chainermn:
-        optimizer = chainermn.create_multi_node_optimizer(optimizer, comm)
+    optimizer = torch.optim.RMSprop(model.parameters(), lr=0.001, weight_decay=10 ** (-4))
 
-    if len(devices) == 1:
-        updater = training.updaters.StandardUpdater(train_iter, optimizer, converter=formulanet.convert, device=devices[0])
-    else:
-        devices_dict = {}
-        devices_dict["main"] = devices[0]
-        for i in range(1, len(devices)):
-            devices_dict["device" + str(i)] = devices[i]
-        updater = training.updaters.ParallelUpdater(train_iter, optimizer, converter=formulanet.convert, devices=devices_dict)
+    def loss(y_pred, y):
+        assert len(y_pred) % len(y) == 0
+        return F.cross_entropy(y_pred, y.repeat(len(y_pred) // len(y)))
 
-    trainer = training.Trainer(updater, (args.epoch, 'epoch'), out=os.path.join(args.out))
-    trainer.extend(extensions.ExponentialShift("lr", rate=1 / 3.0), trigger=(1, 'epoch'))
+    trainer = ignite.engine.create_supervised_trainer(
+        model, optimizer, loss, device=device,
+        prepare_batch=formulanet.prepare_batch)
 
-    evaluator = extensions.Evaluator(test_iter, model, device=devices[0], converter=formulanet.convert)
-    if args.chainermn:
-        evaluator = chainermn.create_multi_node_evaluator(evaluator, comm)
-    trainer.extend(evaluator)
+    def output_transform(y_pred, y):
+        return y_pred[-len(y):], y
 
-    if not args.chainermn or comm.rank == 0:
-        trainer.extend(extensions.LogReport())
-        trainer.extend(extensions.PrintReport(
-            ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
-             'elapsed_time']))
-        trainer.extend(
-            extensions.PlotReport(['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
-        trainer.extend(extensions.PlotReport(['main/accuracy', 'validation/main/accuracy'], x_key='epoch',
-                                             file_name='accuracy.png'))
-        trainer.extend(extensions.ProgressBar(update_interval=10))
-        trainer.extend(extensions.snapshot_object(model, filename='model_epoch-{.updater.epoch}'))
+    evaluator = ignite.engine.create_supervised_evaluator(
+        model,
+        metrics={
+            'accuracy': ignite.metrics.Accuracy(output_transform),
+            'loss': ignite.metrics.Loss(loss),
+        },
+        device=device,
+        prepare_batch=formulanet.prepare_batch)
 
-    snapshot = extensions.snapshot(filename='snapshot_epoch-{.updater.epoch}', autoload=args.autoload)
-    if args.chainermn:
-        replica_sets = [[0], range(1, comm.size)]
-        snapshot = chainermn.extensions.multi_node_snapshot(comm, snapshot, replica_sets)
-    trainer.extend(snapshot, trigger=(1, 'epoch'))
+    @trainer.on(ignite.engine.Events.EPOCH_COMPLETED)
+    def validation(engine):
+        evaluator.run(val_loader)
+        average_accuracy = evaluator.state.metrics['accuracy']
+        average_loss = evaluator.state.metrics['loss']
+        print(average_accuracy, average_loss)
+
+    optimizer.target = model
+    trainer.out = args.out
 
     if args.resume:
         # Resume from a snapshot
-        chainer.serializers.load_npz(args.resume, trainer)
+        cpm.ignite.load_chainer_snapshot(trainer, optimizer, args.resume)
 
-    trainer.run()
+    # Add a bunch of extensions
+    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ExponentialShift(
+        "lr", rate=1 / 3.0), trigger=(1, 'epoch'))
+    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.LogReport())
+    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PrintReport(
+        ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
+         'elapsed_time']))
+    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
+        ['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
+    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
+        ['main/accuracy', 'validation/main/accuracy'], x_key='epoch', file_name='accuracy.png'))
+    snapshot = extensions.snapshot(filename='snapshot_epoch-{.updater.epoch}')
+    if args.chainermn:
+        replica_sets = [[0], range(1, comm.size)]
+        snapshot = chainermn.extensions.multi_node_snapshot(comm, snapshot, replica_sets)
+    cpm.ignite.add_trainer_extension(trainer, optimizer, snapshot, trigger=(1, 'epoch'))
+    
+    trainer.run(train_loader, max_epochs=args.epoch)
 
     if not args.chainermn or comm.rank == 0:
-        chainer.serializers.save_npz(os.path.join(args.out, 'model_final'), model)
-        chainer.serializers.save_npz(os.path.join(args.out, 'optimizer_final'), optimizer)
+        torch.save(model.state_dict(), os.path.join(args.out, 'model_final.pt'))
 
 
 if __name__ == '__main__':

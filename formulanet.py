@@ -1,9 +1,5 @@
 import chainer
-from chainer import dataset, Variable
-import chainer.functions as F
-import chainer.links as L
-from chainer import reporter
-from chainer.utils import CooMatrix
+from chainer import dataset
 import h5py
 import numpy as np
 from pathlib import Path
@@ -14,13 +10,13 @@ import holstep
 import parser_funcparselib
 import tree
 
+from torch import nn
+import torch.nn.functional as F
+import torch
 
-try:
-    import cupy
-    Array = Union[np.ndarray, cupy.ndarray]
-except ImportError:
-    Array = np.ndarray
-VariableOrArray = Union[Variable, Array]
+
+Array = np.ndarray
+VariableOrArray = Union[torch.Tensor, Array]
 
 
 DIM = 256
@@ -37,88 +33,83 @@ class GraphsData(NamedTuple):
     labels: Array
     edges: Array
     treelets: Array
-    MI: CooMatrix
-    MO: CooMatrix
-    ML: CooMatrix
-    MH: CooMatrix
-    MR: CooMatrix
+    MI: torch.sparse.FloatTensor
+    MO: torch.sparse.FloatTensor
+    ML: torch.sparse.FloatTensor
+    MH: torch.sparse.FloatTensor
+    MR: torch.sparse.FloatTensor
 
 
-class FP(chainer.Chain):
+class FP(nn.Module):
     def __init__(self):
         super().__init__()
-        with self.init_scope():
-            self.fc = L.Linear(DIM, DIM)
-            self.bn = L.BatchNormalization(DIM)
+        self.fc = nn.Linear(DIM, DIM)
+        self.bn = nn.BatchNorm1d(DIM)
 
-    def forward(self, x: VariableOrArray) -> Variable:
+    def forward(self, x: VariableOrArray) -> torch.Tensor:
         return F.relu(self.bn(self.fc(x)))
 
 
-class Block(chainer.Chain):
+class Block(nn.Module):
     def __init__(self, n_input: int) -> None:
         super().__init__()
         self._n_input = n_input
-        with self.init_scope():
-            self.fc1 = L.Linear(DIM * n_input, DIM)
-            self.fc2 = L.Linear(DIM, DIM)
-            self.bn1 = L.BatchNormalization(DIM)
-            self.bn2 = L.BatchNormalization(DIM)
+        self.fc1 = nn.Linear(DIM * n_input, DIM)
+        self.fc2 = nn.Linear(DIM, DIM)
+        self.bn1 = nn.BatchNorm1d(DIM)
+        self.bn2 = nn.BatchNorm1d(DIM)
 
-    def forward(self, *args: VariableOrArray) -> Variable:
+    def forward(self, *args: VariableOrArray) -> torch.Tensor:
         assert len(args) == self._n_input
-        h = F.relu(self.bn1(self.fc1(F.concat(args))))
+        h = F.relu(self.bn1(self.fc1(torch.cat(args, dim=1))))
         h = F.relu(self.bn2(self.fc2(h)))
         return h
 
 
-class Block2(chainer.Chain):
+class Block2(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        with self.init_scope():
-            self.fc1a = L.Linear(DIM, DIM, nobias=True)
-            self.fc1b = L.Linear(DIM, DIM, nobias=False)
-            self.fc2 = L.Linear(DIM, DIM)
-            self.bn1 = L.BatchNormalization(DIM)
-            self.bn2 = L.BatchNormalization(DIM)
+        self.fc1a = nn.Linear(DIM, DIM, bias=False)
+        self.fc1b = nn.Linear(DIM, DIM, bias=True)
+        self.fc2 = nn.Linear(DIM, DIM)
+        self.bn1 = nn.BatchNorm1d(DIM)
+        self.bn2 = nn.BatchNorm1d(DIM)
 
-    def forward(self, arg: VariableOrArray) -> Variable:
+    def forward(self, arg: VariableOrArray) -> torch.Tensor:
         h = F.relu(self.bn1(arg))
         h = F.relu(self.bn2(self.fc2(h)))
         return h
 
 
-class Block3(chainer.Chain):
+class Block3(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        with self.init_scope():
-            self.fc1a = L.Linear(DIM, DIM, nobias=True)
-            self.fc1b = L.Linear(DIM, DIM, nobias=True)
-            self.fc1c = L.Linear(DIM, DIM, nobias=False)
-            self.fc2 = L.Linear(DIM, DIM)
-            self.bn1 = L.BatchNormalization(DIM)
-            self.bn2 = L.BatchNormalization(DIM)
+        self.fc1a = nn.Linear(DIM, DIM, bias=False)
+        self.fc1b = nn.Linear(DIM, DIM, bias=False)
+        self.fc1c = nn.Linear(DIM, DIM, bias=True)
+        self.fc2 = nn.Linear(DIM, DIM)
+        self.bn1 = nn.BatchNorm1d(DIM)
+        self.bn2 = nn.BatchNorm1d(DIM)
 
-    def forward(self, arg: VariableOrArray) -> Variable:
+    def forward(self, arg: VariableOrArray) -> torch.Tensor:
         h = F.relu(self.bn1(arg))
         h = F.relu(self.bn2(self.fc2(h)))
         return h
 
 
-class Step(chainer.Chain):
+class Step(nn.Module):
     def __init__(self, order_preserving: bool) -> None:
         super().__init__()
         self._order_preserving = order_preserving
-        with self.init_scope():
-            self.FP = FP()
-            self.FI = Block2()
-            self.FO = Block2()
-            if order_preserving:
-                self.FH = Block3()
-                self.FL = Block3()
-                self.FR = Block3()
+        self.FP = FP()
+        self.FI = Block2()
+        self.FO = Block2()
+        if order_preserving:
+            self.FH = Block3()
+            self.FL = Block3()
+            self.FR = Block3()
 
-    def forward(self, gs: GraphsData, x: VariableOrArray) -> Variable:
+    def forward(self, gs: GraphsData, x: VariableOrArray) -> torch.Tensor:
         x_new = x
 
         FI_fc1a_x = self.FI.fc1a(x)
@@ -131,10 +122,10 @@ class Step(chainer.Chain):
         FI_outputs = self.FI(FI_inputs)
         FO_outputs = self.FO(FO_inputs)
 
-        d = F.sparse_matmul(gs.MI, FI_outputs) + \
-            F.sparse_matmul(gs.MO, FO_outputs)
+        d = torch.sparse.mm(gs.MI, FI_outputs) + \
+            torch.sparse.mm(gs.MO, FO_outputs)
 
-        x_new += d
+        x_new = x_new + d
 
         if self._order_preserving:
             FL_fc1a_x = self.FL.fc1a(x)
@@ -154,59 +145,46 @@ class Step(chainer.Chain):
             FH_outputs = self.FH(FH_inputs)
             FR_outputs = self.FR(FR_inputs)
 
-            d = F.sparse_matmul(gs.ML, FL_outputs) + \
-                F.sparse_matmul(gs.MH, FH_outputs) + \
-                F.sparse_matmul(gs.MR, FR_outputs)
+            d = torch.sparse.mm(gs.ML, FL_outputs.unsqueeze(1)) + \
+                torch.sparse.mm(gs.MH, FH_outputs.unsqueeze(1)) + \
+                torch.sparse.mm(gs.MR, FR_outputs.unsqueeze(1))
+            d = d.squeeze(1)
 
-            x_new += d
+            x_new = x_new + d
 
         return self.FP(x_new)
 
 
-class Classifier(chainer.Chain):
+class Classifier(nn.Module):
     def __init__(self, conditional: bool = True) -> None:
         super().__init__()
         self._conditional = conditional
-        with self.init_scope():
-            self.fc1 = L.Linear(2 * DIM if conditional else DIM, DIM)
-            self.bn = L.BatchNormalization(DIM)
-            self.fc2 = L.Linear(DIM, 2)
+        self.fc1 = nn.Linear(2 * DIM if conditional else DIM, DIM)
+        self.bn = nn.BatchNorm1d(DIM)
+        self.fc2 = nn.Linear(DIM, 2)
 
-    def forward(self, *args: VariableOrArray) -> Variable:
+    def forward(self, *args: VariableOrArray) -> torch.Tensor:
         if self._conditional:
             assert len(args) == 2
         else:
             assert len(args) == 1
-        return self.fc2(F.relu(self.bn(self.fc1(F.concat(args)))))
+        return self.fc2(F.relu(self.bn(self.fc1(torch.cat(args, dim=1)))))
 
 
-class FormulaNet(chainer.Chain):
+class FormulaNet(nn.Module):
     def __init__(self, vocab_size: int, steps: int, order_preserving: bool, conditional: bool) -> None:
         super().__init__()
         self._order_preserving = order_preserving
         self._conditional = conditional
+        self.embed_id = nn.Embedding(vocab_size, DIM)
+        self.steps = nn.ModuleList([Step(order_preserving) for _ in range(steps)])
+        self.classifier = Classifier(conditional)
 
-        with self.init_scope():
-            self.embed_id = L.EmbedID(vocab_size, DIM)
-            self.steps = chainer.ChainList(*[Step(order_preserving) for _ in range(steps)])
-            self.classifier = Classifier(conditional)
-
-    def forward(self, gs: GraphsData, minibatch: List[Tuple[int, int, bool]]) -> Variable:
-        predicted, loss = self._forward(gs, minibatch)
-        self.loss = loss
-        reporter.report({'loss': self.loss}, self)
-
-        with chainer.cuda.get_device_from_array(predicted.array):
-            expected = self.xp.array([1 if y else 0 for (conj, stmt, y) in minibatch], np.int32)
-        self.accuracy = F.accuracy(predicted, expected)
-        reporter.report({'accuracy': self.accuracy}, self)
-
-        return loss
-
-    def _forward(self, gs: GraphsData, minibatch: List[Tuple[int, int, bool]]) -> Tuple[Variable, Variable]:
+    def forward(self, tmp) -> torch.Tensor:
+        # tmp: Tuple[GraphsData, List[Tuple[int, int, bool]]], labels: Array
+        gs, minibatch = tmp
         stmt_embeddings = []
         conj_embeddings = []
-        labels = []
 
         def collect_embedding() -> None:
             es = [self._compute_graph_embedding(gs, x, j) for j in range(len(gs.node_ranges))]
@@ -214,7 +192,6 @@ class FormulaNet(chainer.Chain):
                 stmt_embeddings.append(es[stmt])
                 if self._conditional:
                     conj_embeddings.append(es[conj])
-                labels.append(1 if y else 0)
 
         x = self._initial_nodes_embedding(gs)
         collect_embedding()
@@ -223,19 +200,16 @@ class FormulaNet(chainer.Chain):
             collect_embedding()
 
         if self._conditional:
-            predicted = self.classifier(F.vstack(conj_embeddings), F.vstack(stmt_embeddings))
+            predicted = self.classifier(torch.cat(conj_embeddings, dim=0), torch.cat(stmt_embeddings, dim=0))
         else:
-            predicted = self.classifier(F.vstack(stmt_embeddings))
+            predicted = self.classifier(torch.cat(stmt_embeddings, dim=0))
 
-        with chainer.cuda.get_device_from_array(predicted.array):
-            labels = self.xp.array(labels, dtype=np.int32)
-
-        return predicted[-len(minibatch):], F.softmax_cross_entropy(predicted, labels)
+        return predicted
 
     def predict(self, gs: GraphsData, conj: int, stmt: int) -> bool:
         return F.argmax(self.logit(gs, conj, stmt)) > 0
 
-    def logit(self, gs: GraphsData, conj: int, stmt: int) -> Variable:
+    def logit(self, gs: GraphsData, conj: int, stmt: int) -> torch.Tensor:
         x = self._initial_nodes_embedding(gs)
         for (i, step) in enumerate(self.steps):
             x = step(gs, x)
@@ -247,12 +221,12 @@ class FormulaNet(chainer.Chain):
         else:
             return self.classifier(stmt_embedding)[0]
 
-    def _initial_nodes_embedding(self, gs: GraphsData) -> Variable:
+    def _initial_nodes_embedding(self, gs: GraphsData) -> torch.Tensor:
         return self.embed_id(gs.labels)
 
-    def _compute_graph_embedding(self, gs: GraphsData, x: Array, stmt: int) -> Variable:
+    def _compute_graph_embedding(self, gs: GraphsData, x: Array, stmt: int) -> torch.Tensor:
         (beg, end) = gs.node_ranges[stmt]
-        return F.max(x[beg:end], axis=0, keepdims=True)
+        return torch.max(x[beg:end], dim=0, keepdims=True)[0]
 
 
 class Dataset(dataset.DatasetMixin):
@@ -333,9 +307,7 @@ class Dataset(dataset.DatasetMixin):
         )
 
 
-@chainer.dataset.converter()
-def convert(minibatch: List[Tuple[GraphData, GraphData, bool]], device: Optional[chainer.backend.Device]) -> Tuple[
-    GraphsData, List[Tuple[int, int, bool]]]:
+def convert(minibatch: List[Tuple[GraphData, GraphData, bool]]) -> Tuple[GraphsData, List[Tuple[int, int, bool]]]:
     node_offset = 0
     node_ranges = []  # type: List[Tuple[int,int]]
     edge_offset = 0
@@ -431,34 +403,33 @@ def convert(minibatch: List[Tuple[GraphData, GraphData, bool]], device: Optional
 
     minibatch2 = [(f(conj), f(stmt), y) for (conj, stmt, y) in minibatch]
 
-    def arr_f(x: List[float]) -> Array:
-        return chainer.dataset.convert.to_device(device, np.array(x, dtype=chainer.get_dtype()))
+    MI = torch.sparse.FloatTensor(
+        torch.LongTensor([MI_row, MI_col]),
+        torch.FloatTensor(MI_data),
+        torch.Size((node_offset, edge_offset)))
+    MO = torch.sparse.FloatTensor(
+        torch.LongTensor([MO_row, MO_col]),
+        torch.FloatTensor(MO_data),
+        torch.Size((node_offset, edge_offset)))
 
-    def arr_i(x: List[int]) -> Array:
-        return chainer.dataset.convert.to_device(device, np.array(x, dtype=np.int32))
-
-    MI = CooMatrix(
-        arr_f(MI_data), arr_i(MI_row), arr_i(MI_col),
-        shape=(node_offset, edge_offset))
-    MO = CooMatrix(
-        arr_f(MO_data), arr_i(MO_row), arr_i(MO_col),
-        shape=(node_offset, edge_offset))
-
-    ML = CooMatrix(
-        arr_f(ML_data), arr_i(ML_row), arr_i(ML_col),
-        shape=(node_offset, treelet_offset))
-    MH = CooMatrix(
-        arr_f(MH_data), arr_i(MH_row), arr_i(MH_col),
-        shape=(node_offset, treelet_offset))
-    MR = CooMatrix(
-        arr_f(MR_data), arr_i(MR_row), arr_i(MR_col),
-        shape=(node_offset, treelet_offset))
+    ML = torch.sparse.FloatTensor(
+        torch.LongTensor([ML_row, ML_col]),
+        torch.FloatTensor(ML_data),
+        torch.Size((node_offset, treelet_offset)))
+    MH = torch.sparse.FloatTensor(
+        torch.LongTensor([MH_row, MH_col]),
+        torch.FloatTensor(MH_data),
+        torch.Size((node_offset, treelet_offset)))
+    MR = torch.sparse.FloatTensor(
+        torch.LongTensor([MR_row, MR_col]),
+        torch.FloatTensor(MR_data),
+        torch.Size((node_offset, treelet_offset)))
 
     gs = GraphsData(
         node_ranges=node_ranges,
-        labels=chainer.dataset.convert.to_device(device, np.concatenate(labels)),
-        edges=chainer.dataset.convert.to_device(device, np.concatenate(edges)),
-        treelets=chainer.dataset.convert.to_device(device, np.concatenate(treelets)),
+        labels=torch.from_numpy(np.concatenate(labels)).to(torch.int64),
+        edges=torch.from_numpy(np.concatenate(edges)).to(torch.int64),
+        treelets=torch.from_numpy(np.concatenate(treelets)).to(torch.int64),
         MI=MI,
         MO=MO,
         ML=ML,
@@ -467,3 +438,25 @@ def convert(minibatch: List[Tuple[GraphData, GraphData, bool]], device: Optional
     )
 
     return gs, minibatch2
+
+
+def prepare_batch(
+    batch: Tuple[GraphsData, List[Tuple[int, int, bool]]],
+    device: torch.device = None,
+    non_blocking: bool = False
+) -> Tuple[Tuple[GraphsData, List[Tuple[int, int, bool]]], torch.Tensor]:
+    gs, minibatch = batch
+    gs = GraphsData(
+        node_ranges=gs.node_ranges,
+        labels=gs.labels.to(device), # , dtype=torch.int64
+        edges=gs.edges.to(device),
+        treelets=gs.treelets.to(device),
+        MI=gs.MI.to(device),
+        MO=gs.MO.to(device),
+        ML=gs.ML.to(device),
+        MH=gs.MH.to(device),
+        MR=gs.MR.to(device),
+    )
+    labels = torch.tensor([1 if y else 0 for (conj, stmt, y) in minibatch])
+    labels = labels.to(device)
+    return (gs, minibatch), labels
