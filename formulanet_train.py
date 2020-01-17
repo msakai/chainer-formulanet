@@ -100,8 +100,8 @@ def main():
         train._dataset._h5f = train_h5f
         test._dataset._h5f = test_h5f
 
-    train_loader = torch.utils.data.DataLoader(train, collate_fn=formulanet.convert, shuffle=True, batch_size=args.batchsize, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test, collate_fn=formulanet.convert, shuffle=False, batch_size=args.batchsize, pin_memory=True)
+    train_loader = torch.utils.data.DataLoader(train, collate_fn=formulanet.convert, shuffle=True, batch_size=args.batchsize)
+    test_loader = torch.utils.data.DataLoader(test, collate_fn=formulanet.convert, shuffle=False, batch_size=args.batchsize)
 
     model = formulanet.FormulaNet(vocab_size=len(symbols.symbols), steps=args.steps,
                                   order_preserving=args.preserve_order, conditional=args.conditional)
