@@ -59,16 +59,13 @@ def main():
         # to avoid MPI issue with fork() system call.
         import matplotlib.font_manager
         import chainermn
-        from chainermn.extensions import create_multi_node_checkpointer
         comm = chainermn.create_communicator()
         devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
     else:
         if args.devices == '':
-            devices = []
+            devices = [torch.device("cpu")]
         else:
             devices = list(map(torch.device, args.devices.split(',')))
-        if len(devices) == 0:
-            devices = [torch.device("cpu")]
         print('# Devices: {}'.format(",".join(map(str, devices))))
     #devices[0].use()
     device = devices[0]
