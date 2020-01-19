@@ -155,6 +155,7 @@ def main():
         ['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
     cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
         ['main/accuracy', 'validation/main/accuracy'], x_key='epoch', file_name='accuracy.png'))
+    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ProgressBar(update_interval=10))
     snapshot = extensions.snapshot(filename='snapshot_epoch-{.updater.epoch}')
     if args.chainermn:
         replica_sets = [[0], range(1, comm.size)]
