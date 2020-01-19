@@ -29,6 +29,7 @@ sys.setrecursionlimit(10000)
 def main():
     parser = argparse.ArgumentParser(description='chainer formulanet trainer')
 
+    parser.add_argument('--chainermn', action='store_true', help='Use ChainerMN')
     parser.add_argument('--batchsize', '-b', type=int, default=32,
                         help='Number of examples in each mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=5,
@@ -52,15 +53,16 @@ def main():
     parser.add_argument('--steps', type=int, default="3", help='Number of update steps')
 
     args = parser.parse_args()
-    args.chainermn = False
 
     if args.chainermn:
         # matplotlib.font_manager should be imported before mpi4py.MPI
         # to avoid MPI issue with fork() system call.
         import matplotlib.font_manager
-        import chainermn
+        from chainer_pytorch_migration import chainermn
         comm = chainermn.create_communicator()
-        devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
+        devices = [torch.device("cuda:" + str(comm.intra_rank))]
+        chainer_devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
+        chainer_devices[0].use()
     else:
         if args.devices == '':
             devices = [torch.device("cpu")]
@@ -90,12 +92,12 @@ def main():
         # XXX: h5py.File cannot be distributed
         if comm.rank == 0:
             train._h5f = None
-            test._h5f = None
+            #test._h5f = None
         train = chainermn.scatter_dataset(train, comm)
-        test = chainermn.scatter_dataset(test, comm)
+        #test = chainermn.scatter_dataset(test, comm)
         # We assume train and test are chainer.datasets.SubDataset.
         train._dataset._h5f = train_h5f
-        test._dataset._h5f = test_h5f
+        #test._dataset._h5f = test_h5f
 
     train_loader = torch.utils.data.DataLoader(train, collate_fn=formulanet.convert, shuffle=True, batch_size=args.batchsize)
     test_loader = torch.utils.data.DataLoader(test, collate_fn=formulanet.convert, shuffle=False, batch_size=args.batchsize)
@@ -110,6 +112,12 @@ def main():
     # We lower the learning rate by 3X after each epoch."
     optimizer = torch.optim.RMSprop(model.parameters(), lr=0.001, weight_decay=10 ** (-4))
 
+    if args.chainermn:
+        w_model = cpm.links.TorchModule(model)
+        w_model.to_device(chainer_devices[0])
+        optimizer = chainermn.create_multi_node_optimizer(optimizer, comm)
+        optimizer.setup(w_model)
+
     def loss(y_pred, y):
         assert len(y_pred) % len(y) == 0
         return F.cross_entropy(y_pred, y.repeat(len(y_pred) // len(y)))
@@ -121,21 +129,22 @@ def main():
     def output_transform(y_pred, y):
         return y_pred[-len(y):], y
 
-    evaluator = ignite.engine.create_supervised_evaluator(
-        model,
-        metrics={
-            'accuracy': ignite.metrics.Accuracy(output_transform),
-            'loss': ignite.metrics.Loss(loss),
-        },
-        device=device,
-        prepare_batch=formulanet.prepare_batch)
+    if not args.chainermn or comm.rank == 0:
+        evaluator = ignite.engine.create_supervised_evaluator(
+            model,
+            metrics={
+                'accuracy': ignite.metrics.Accuracy(output_transform),
+                'loss': ignite.metrics.Loss(loss),
+            },
+            device=device,
+            prepare_batch=formulanet.prepare_batch)
 
-    @trainer.on(ignite.engine.Events.EPOCH_COMPLETED)
-    def validation(engine):
-        evaluator.run(val_loader)
-        average_accuracy = evaluator.state.metrics['accuracy']
-        average_loss = evaluator.state.metrics['loss']
-        print(average_accuracy, average_loss)
+        @trainer.on(ignite.engine.Events.EPOCH_COMPLETED)
+        def validation(engine):
+            evaluator.run(val_loader)
+            average_accuracy = evaluator.state.metrics['accuracy']
+            average_loss = evaluator.state.metrics['loss']
+            print(average_accuracy, average_loss)
 
     optimizer.target = model
     trainer.out = args.out
@@ -147,15 +156,18 @@ def main():
     # Add a bunch of extensions
     cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ExponentialShift(
         "lr", rate=1 / 3.0), trigger=(1, 'epoch'))
-    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.LogReport())
-    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PrintReport(
-        ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
-         'elapsed_time']))
-    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
-        ['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
-    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
-        ['main/accuracy', 'validation/main/accuracy'], x_key='epoch', file_name='accuracy.png'))
-    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ProgressBar(update_interval=10))
+
+    if not args.chainermn or comm.rank == 0:
+        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.LogReport())
+        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PrintReport(
+            ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
+             'elapsed_time']))
+        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
+            ['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
+        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
+            ['main/accuracy', 'validation/main/accuracy'], x_key='epoch', file_name='accuracy.png'))
+        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ProgressBar(update_interval=10))
+
     snapshot = extensions.snapshot(filename='snapshot_epoch-{.updater.epoch}')
     if args.chainermn:
         replica_sets = [[0], range(1, comm.size)]
