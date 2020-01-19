@@ -1,10 +1,9 @@
-import chainer
 from chainer import dataset
 import h5py
 import numpy as np
 from pathlib import Path
 import re
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Dict, List, NamedTuple, Tuple, Union
 
 import holstep
 import parser_funcparselib
@@ -15,24 +14,20 @@ import torch.nn.functional as F
 import torch
 
 
-Array = np.ndarray
-VariableOrArray = Union[torch.Tensor, Array]
-
-
 DIM = 256
 
-    
+
 class GraphData(NamedTuple):
-    labels: Array
-    edges: Array
-    treelets: Array
+    labels: np.ndarray
+    edges: np.ndarray
+    treelets: np.ndarray
 
 
 class GraphsData(NamedTuple):
-    node_ranges: Array
-    labels: Array
-    edges: Array
-    treelets: Array
+    node_ranges: List[Tuple[int, int]]
+    labels: torch.Tensor
+    edges: torch.Tensor
+    treelets: torch.Tensor
     MI: torch.sparse.FloatTensor
     MO: torch.sparse.FloatTensor
     ML: torch.sparse.FloatTensor
@@ -46,7 +41,7 @@ class FP(nn.Module):
         self.fc = nn.Linear(DIM, DIM)
         self.bn = nn.BatchNorm1d(DIM)
 
-    def forward(self, x: VariableOrArray) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.relu(self.bn(self.fc(x)))
 
 
@@ -59,7 +54,7 @@ class Block(nn.Module):
         self.bn1 = nn.BatchNorm1d(DIM)
         self.bn2 = nn.BatchNorm1d(DIM)
 
-    def forward(self, *args: VariableOrArray) -> torch.Tensor:
+    def forward(self, *args: torch.Tensor) -> torch.Tensor:
         assert len(args) == self._n_input
         h = F.relu(self.bn1(self.fc1(torch.cat(args, dim=1))))
         h = F.relu(self.bn2(self.fc2(h)))
@@ -75,7 +70,7 @@ class Block2(nn.Module):
         self.bn1 = nn.BatchNorm1d(DIM)
         self.bn2 = nn.BatchNorm1d(DIM)
 
-    def forward(self, arg: VariableOrArray) -> torch.Tensor:
+    def forward(self, arg: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.bn1(arg))
         h = F.relu(self.bn2(self.fc2(h)))
         return h
@@ -91,7 +86,7 @@ class Block3(nn.Module):
         self.bn1 = nn.BatchNorm1d(DIM)
         self.bn2 = nn.BatchNorm1d(DIM)
 
-    def forward(self, arg: VariableOrArray) -> torch.Tensor:
+    def forward(self, arg: torch.Tensor) -> torch.Tensor:
         h = F.relu(self.bn1(arg))
         h = F.relu(self.bn2(self.fc2(h)))
         return h
@@ -109,7 +104,7 @@ class Step(nn.Module):
             self.FL = Block3()
             self.FR = Block3()
 
-    def forward(self, gs: GraphsData, x: VariableOrArray) -> torch.Tensor:
+    def forward(self, gs: GraphsData, x: torch.Tensor) -> torch.Tensor:
         x_new = x
 
         FI_fc1a_x = self.FI.fc1a(x)
@@ -163,7 +158,7 @@ class Classifier(nn.Module):
         self.bn = nn.BatchNorm1d(DIM)
         self.fc2 = nn.Linear(DIM, 2)
 
-    def forward(self, *args: VariableOrArray) -> torch.Tensor:
+    def forward(self, *args: torch.Tensor) -> torch.Tensor:
         if self._conditional:
             assert len(args) == 2
         else:
@@ -180,15 +175,14 @@ class FormulaNet(nn.Module):
         self.steps = nn.ModuleList([Step(order_preserving) for _ in range(steps)])
         self.classifier = Classifier(conditional)
 
-    def forward(self, tmp) -> torch.Tensor:
-        # tmp: Tuple[GraphsData, List[Tuple[int, int, bool]]], labels: Array
-        gs, minibatch = tmp
-        stmt_embeddings = []
-        conj_embeddings = []
+    def forward(self, args: Tuple[GraphsData, List[Tuple[int, int]]]) -> torch.Tensor:
+        gs, minibatch = args
+        stmt_embeddings: List[torch.Tensor] = []
+        conj_embeddings: List[torch.Tensor] = []
 
         def collect_embedding() -> None:
             es = [self._compute_graph_embedding(gs, x, j) for j in range(len(gs.node_ranges))]
-            for (conj, stmt, y) in minibatch:
+            for (conj, stmt) in minibatch:
                 stmt_embeddings.append(es[stmt])
                 if self._conditional:
                     conj_embeddings.append(es[conj])
@@ -224,7 +218,7 @@ class FormulaNet(nn.Module):
     def _initial_nodes_embedding(self, gs: GraphsData) -> torch.Tensor:
         return self.embed_id(gs.labels)
 
-    def _compute_graph_embedding(self, gs: GraphsData, x: Array, stmt: int) -> torch.Tensor:
+    def _compute_graph_embedding(self, gs: GraphsData, x: torch.Tensor, stmt: int) -> torch.Tensor:
         (beg, end) = gs.node_ranges[stmt]
         return torch.max(x[beg:end], dim=0, keepdims=True)[0]
 
@@ -444,11 +438,11 @@ def prepare_batch(
     batch: Tuple[GraphsData, List[Tuple[int, int, bool]]],
     device: torch.device = None,
     non_blocking: bool = False
-) -> Tuple[Tuple[GraphsData, List[Tuple[int, int, bool]]], torch.Tensor]:
+) -> Tuple[Tuple[GraphsData, List[Tuple[int, int]]], torch.Tensor]:
     gs, minibatch = batch
     gs = GraphsData(
         node_ranges=gs.node_ranges,
-        labels=gs.labels.to(device), # , dtype=torch.int64
+        labels=gs.labels.to(device),
         edges=gs.edges.to(device),
         treelets=gs.treelets.to(device),
         MI=gs.MI.to(device),
@@ -459,4 +453,4 @@ def prepare_batch(
     )
     labels = torch.tensor([1 if y else 0 for (conj, stmt, y) in minibatch])
     labels = labels.to(device)
-    return (gs, minibatch), labels
+    return (gs, [(conj, stmt) for conj, stmt, y in minibatch]), labels
