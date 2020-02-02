@@ -164,11 +164,11 @@ def main():
             ['main/accuracy', 'validation/main/accuracy'], x_key='epoch', file_name='accuracy.png'))
         cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ProgressBar(update_interval=10))
 
-    snapshot = extensions.snapshot(filename='snapshot_epoch-{.updater.epoch}')
+    snapshot = extensions.snapshot(filename='snapshot_{.updater.iteration}', n_retains=2)
     if args.chainermn:
         replica_sets = [[0], range(1, comm.size)]
         snapshot = chainermn.extensions.multi_node_snapshot(comm, snapshot, replica_sets)
-    cpm.ignite.add_trainer_extension(trainer, optimizer, snapshot, trigger=(1, 'epoch'))
+    cpm.ignite.add_trainer_extension(trainer, optimizer, snapshot, trigger=(100, 'iteration'))
 
     if args.resume:
         # Resume from a snapshot
