@@ -106,7 +106,9 @@ def main():
                                   order_preserving=args.preserve_order, conditional=args.conditional)
 
     if len(devices) == 1:
-        model.to(devices[0])
+        model.to(device)
+    else:
+        model = torch.nn.DataParallel(model, device_ids=devices)
 
     # "We train our networks using RMSProp [47] with 0.001 learning rate and 1 × 10−4 weight decay.
     # We lower the learning rate by 3X after each epoch."
