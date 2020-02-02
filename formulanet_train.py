@@ -149,10 +149,6 @@ def main():
     optimizer.target = model
     trainer.out = args.out
 
-    if args.resume:
-        # Resume from a snapshot
-        cpm.ignite.load_chainer_snapshot(trainer, optimizer, args.resume)
-
     # Add a bunch of extensions
     cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ExponentialShift(
         "lr", rate=1 / 3.0), trigger=(1, 'epoch'))
@@ -173,6 +169,10 @@ def main():
         replica_sets = [[0], range(1, comm.size)]
         snapshot = chainermn.extensions.multi_node_snapshot(comm, snapshot, replica_sets)
     cpm.ignite.add_trainer_extension(trainer, optimizer, snapshot, trigger=(1, 'epoch'))
+
+    if args.resume:
+        # Resume from a snapshot
+        cpm.ignite.load_chainer_snapshot(trainer, optimizer, args.resume)
     
     trainer.run(train_loader, max_epochs=args.epoch)
 
