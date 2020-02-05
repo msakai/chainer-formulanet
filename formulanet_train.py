@@ -29,7 +29,7 @@ sys.setrecursionlimit(10000)
 def main():
     parser = argparse.ArgumentParser(description='chainer formulanet trainer')
 
-    parser.add_argument('--chainermn', action='store_true', help='Use ChainerMN')
+    parser.add_argument('--distributed', action='store_true', help='Use torch.distributed')
     parser.add_argument('--batchsize', '-b', type=int, default=32,
                         help='Number of examples in each mini-batch')
     parser.add_argument('--epoch', '-e', type=int, default=5,
@@ -54,15 +54,22 @@ def main():
 
     args = parser.parse_args()
 
-    if args.chainermn:
-        # matplotlib.font_manager should be imported before mpi4py.MPI
-        # to avoid MPI issue with fork() system call.
-        import matplotlib.font_manager
-        from chainer_pytorch_migration import chainermn
-        comm = chainermn.create_communicator()
-        devices = [torch.device("cuda:" + str(comm.intra_rank))]
-        chainer_devices = [chainer.get_device("@cupy:" + str(comm.intra_rank))]
-        chainer_devices[0].use()
+    if args.distributed:
+        import torch.distributed
+        import torch.utils.data.distributed
+        from torch.nn.parallel import DistributedDataParallel
+
+        # setup env for torch.distributed
+        comm_world_size = int(os.environ["OMPI_COMM_WORLD_SIZE"])
+        comm_rank = int(os.environ["OMPI_COMM_WORLD_RANK"])
+        comm_local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+
+        os.environ["WORLD_SIZE"] = str(comm_world_size)
+        os.environ["RANK"] = str(comm_rank)
+        torch.cuda.set_device(comm_local_rank)
+        torch.distributed.init_process_group(backend='nccl', init_method='env://')
+
+        devices = [torch.device("cuda:" + str(comm_local_rank))]
     else:
         if args.devices == '':
             devices = [torch.device("cpu")]
@@ -72,7 +79,7 @@ def main():
     #devices[0].use()
     device = devices[0]
 
-    if not args.chainermn or comm.rank == 0:
+    if not args.distributed or comm_rank == 0:
         print('# epoch: {}'.format(args.epoch))
         print('# conditional: {}'.format(args.conditional))
         print('# order_preserving: {}'.format(args.preserve_order))
@@ -82,24 +89,16 @@ def main():
     train_h5f = h5py.File(os.path.join(args.dataset, "train.h5"), 'r')
     test_h5f = h5py.File(os.path.join(args.dataset, "test.h5"), 'r')
 
-    if not args.chainermn or comm.rank == 0:
-        train = formulanet.Dataset(symbols.symbols, train_h5f)
-        test = formulanet.Dataset(symbols.symbols, test_h5f)
+    train = formulanet.Dataset(symbols.symbols, train_h5f)
+    test = formulanet.Dataset(symbols.symbols, test_h5f)
+
+    if args.distributed:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train, num_replicas=comm_world_size, rank=comm_rank)
     else:
-        train, test = None, None
+        train_sampler = None
 
-    if args.chainermn:
-        # XXX: h5py.File cannot be distributed
-        if comm.rank == 0:
-            train._h5f = None
-            #test._h5f = None
-        train = chainermn.scatter_dataset(train, comm)
-        #test = chainermn.scatter_dataset(test, comm)
-        # We assume train and test are chainer.datasets.SubDataset.
-        train._dataset._h5f = train_h5f
-        #test._dataset._h5f = test_h5f
-
-    train_loader = torch.utils.data.DataLoader(train, collate_fn=formulanet.convert, shuffle=True, batch_size=args.batchsize)
+    train_loader = torch.utils.data.DataLoader(train, collate_fn=formulanet.convert, batch_size=args.batchsize,
+                                               **({"sampler": train_sampler} if args.distributed else {'shuffle': True}))
     test_loader = torch.utils.data.DataLoader(test, collate_fn=formulanet.convert, shuffle=False, batch_size=args.batchsize)
 
     model = formulanet.FormulaNet(vocab_size=len(symbols.symbols), steps=args.steps,
@@ -107,18 +106,14 @@ def main():
 
     if len(devices) == 1:
         model.to(device)
+        if args.distributed:
+            model = DistributedDataParallel(model, devices)
     else:
         model = torch.nn.DataParallel(model, device_ids=devices)
 
     # "We train our networks using RMSProp [47] with 0.001 learning rate and 1 × 10−4 weight decay.
     # We lower the learning rate by 3X after each epoch."
     optimizer = torch.optim.RMSprop(model.parameters(), lr=0.001, weight_decay=10 ** (-4))
-
-    if args.chainermn:
-        w_model = cpm.links.TorchModule(model)
-        w_model.to_device(chainer_devices[0])
-        optimizer = chainermn.create_multi_node_optimizer(optimizer, comm)
-        optimizer.setup(w_model)
 
     def loss(y_pred, y):
         assert len(y_pred) % len(y) == 0
@@ -131,7 +126,12 @@ def main():
     def output_transform(y_pred, y):
         return y_pred[-len(y):], y
 
-    if not args.chainermn or comm.rank == 0:
+    if args.distributed:
+        @trainer.on(ignite.engine.Events.EPOCH_STARTED)
+        def set_epoch(engine):
+            train_sampler.set_epoch(engine.state.epoch)
+
+    if not args.distributed or comm_rank == 0:
         evaluator = ignite.engine.create_supervised_evaluator(
             model,
             metrics={
@@ -155,7 +155,7 @@ def main():
     cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ExponentialShift(
         "lr", rate=1 / 3.0), trigger=(1, 'epoch'))
 
-    if not args.chainermn or comm.rank == 0:
+    if not args.distributed or comm_rank == 0:
         cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.LogReport())
         cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PrintReport(
             ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
@@ -168,10 +168,10 @@ def main():
         # cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.snapshot_object(
         #     model, filename='model_epoch-{.updater.epoch}'))
 
-    if not args.chainermn:
+    if not args.distributed:
         snapshot = extensions.snapshot(filename='snapshot_{.updater.iteration}', n_retains=2)
-        if args.chainermn:
-            replica_sets = [[0], range(1, comm.size)]
+        if args.distributed:
+            replica_sets = [[0], range(1, comm_world_size)]
             snapshot = chainermn.extensions.multi_node_snapshot(comm, snapshot, replica_sets)
         cpm.ignite.add_trainer_extension(trainer, optimizer, snapshot, trigger=(100, 'iteration'))
 
@@ -181,7 +181,7 @@ def main():
     
     trainer.run(train_loader, max_epochs=args.epoch)
 
-    if not args.chainermn or comm.rank == 0:
+    if not args.distributed or comm_rank == 0:
         torch.save(model.state_dict(), os.path.join(args.out, 'model_final.pt'))
 
 
