@@ -7,7 +7,6 @@ mpl.use('Agg')
 
 import argparse
 import chainer
-from chainer.training import extensions
 import h5py
 import numpy as np
 import os
@@ -16,8 +15,10 @@ import sys
 import torch
 import torch.nn.functional as F
 import ignite
+from ignite.contrib.handlers.param_scheduler import LRScheduler
 import chainer_pytorch_migration as cpm
-import chainer_pytorch_migration.ignite
+import pytorch_pfn_extras as ppe
+import pytorch_pfn_extras.training.extensions as extensions
 
 import formulanet
 import holstep
@@ -142,43 +143,42 @@ def main():
             device=device,
             prepare_batch=formulanet.prepare_batch)
 
-        @trainer.on(ignite.engine.Events.EPOCH_COMPLETED)
-        def validation(engine):
-            evaluator.run(test_loader)
-            average_accuracy = evaluator.state.metrics['accuracy']
-            average_loss = evaluator.state.metrics['loss']
-            print(average_accuracy, average_loss)
-
-    optimizer.target = model
-    trainer.out = args.out
+    models = {'main': model}
+    optimizers = {'main': optimizer}
+    manager = ppe.training.IgniteExtensionsManager(
+        trainer, models, optimizers, args.epoch, out_dir=args.out)
 
     # Add a bunch of extensions
-    cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ExponentialShift(
-        "lr", rate=1 / 3.0), trigger=(1, 'epoch'))
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=1 / 3.0)
+    trainer.add_event_handler(ignite.engine.Events.EPOCH_COMPLETED, LRScheduler(scheduler))
 
     if not args.chainermn or comm.rank == 0:
-        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.LogReport())
-        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PrintReport(
-            ['epoch', 'main/loss', 'main/accuracy', 'validation/main/loss', 'validation/main/accuracy',
-             'elapsed_time']))
-        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
-            ['main/loss', 'validation/main/loss'], x_key='epoch', file_name='loss.png'))
-        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.PlotReport(
-            ['main/accuracy', 'validation/main/accuracy'], x_key='epoch', file_name='accuracy.png'))
-        cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.ProgressBar(update_interval=10))
-        # cpm.ignite.add_trainer_extension(trainer, optimizer, extensions.snapshot_object(
+        manager.extend(extensions.LogReport())
+        manager.extend(extensions.PrintReport(
+            ['epoch', 'train/loss', 'val/loss', 'val/acc']))
+        manager.extend(extensions.PlotReport(
+            ['train/loss', 'val/loss'], x_key='epoch', file_name='loss.png'))
+        manager.extend(extensions.PlotReport(
+            ['val/acc'], x_key='epoch', file_name='accuracy.png'))
+        manager.extend(extensions.ProgressBar(update_interval=10))
+        manager.extend(extensions.IgniteEvaluator(
+            evaluator, test_loader, model, progress_bar=True))
+        # manager.extend(extensions.snapshot_object(
         #     model, filename='model_epoch-{.updater.epoch}'))
 
     if not args.chainermn:
-        snapshot = extensions.snapshot(filename='snapshot_{.updater.iteration}', n_retains=2)
-        if args.chainermn:
-            replica_sets = [[0], range(1, comm.size)]
-            snapshot = chainermn.extensions.multi_node_snapshot(comm, snapshot, replica_sets)
-        cpm.ignite.add_trainer_extension(trainer, optimizer, snapshot, trigger=(100, 'iteration'))
+        writer = extensions.snapshot_writers.SimpleWriter()
+        snapshot = extensions.snapshot(filename='snapshot_{.updater.iteration}', n_retains=2, writer=writer)
+        manager.extend(snapshot, trigger=(100, 'iteration'))
 
     if args.resume:
         # Resume from a snapshot
-        cpm.ignite.load_chainer_snapshot(trainer, optimizer, args.resume)
+        state = torch.load(args.snapshot)
+        manager.load_state_dict(state)
+
+    @trainer.on(ignite.engine.Events.ITERATION_COMPLETED)
+    def report_loss(engine):
+        ppe.reporting.report({'train/loss': engine.state.output})
     
     trainer.run(train_loader, max_epochs=args.epoch)
 
