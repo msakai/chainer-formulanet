@@ -128,7 +128,8 @@ def main():
         model, optimizer, loss, device=device,
         prepare_batch=formulanet.prepare_batch)
 
-    def output_transform(y_pred, y):
+    def output_transform(args):
+        y_pred, y = args
         return y_pred[-len(y):], y
 
     if not args.chainermn or comm.rank == 0:
