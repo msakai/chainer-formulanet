@@ -1,4 +1,3 @@
-from chainer import dataset
 import h5py
 import numpy as np
 from pathlib import Path
@@ -223,7 +222,7 @@ class FormulaNet(nn.Module):
         return torch.max(x[beg:end], dim=0, keepdims=True)[0]
 
 
-class Dataset(dataset.DatasetMixin):
+class Dataset():
     def __init__(self, names: List[str], h5f) -> None:
         super().__init__()
         self._name_to_id = {name: i for (i, name) in enumerate(names)}
@@ -271,6 +270,15 @@ class Dataset(dataset.DatasetMixin):
 
     def __len__(self) -> int:
         return self._len
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            current, stop, step = index.indices(len(self))
+            return [self.get_example(i) for i in range(current, stop, step)]
+        elif isinstance(index, list) or isinstance(index, np.ndarray):
+            return [self.get_example(i) for i in index]
+        else:
+            return self.get_example(index)
 
     def get_example(self, i: int) -> Tuple[GraphData, GraphData, bool]:
         name = self._h5f["examples_conjecture"][i]
