@@ -144,7 +144,7 @@ def main():
 
         @trainer.on(ignite.engine.Events.EPOCH_COMPLETED)
         def validation(engine):
-            evaluator.run(val_loader)
+            evaluator.run(test_loader)
             average_accuracy = evaluator.state.metrics['accuracy']
             average_loss = evaluator.state.metrics['loss']
             print(average_accuracy, average_loss)
