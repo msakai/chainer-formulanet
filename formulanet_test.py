@@ -6,14 +6,12 @@ import matplotlib as mpl
 mpl.use('Agg')
 
 import argparse
-import chainer
-import chainer.functions as F
-from chainer import iterators
 import h5py
 import numpy as np
 import pandas as pd
 import sys
-from tqdm import tqdm
+import torch
+import ignite
 
 import formulanet
 import symbols
@@ -22,15 +20,12 @@ sys.setrecursionlimit(10000)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='chainer formulanet test')
+    parser = argparse.ArgumentParser(description='pytorch formulanet test')
 
     parser.add_argument('--batchsize', '-b', type=int, default=32,
                         help='Number of examples in each mini-batch')
-    parser.add_argument('--device', type=str, default="-1",
-                        help='Device specifier. Either ChainerX device '
-                        'specifier or an integer. If non-negative integer, '
-                        'CuPy arrays with specified device id are used. If '
-                        'negative integer, NumPy arrays are used')
+    parser.add_argument('--device', type=str, default="cpu",
+                        help='Device specifier.')
     parser.add_argument('--dataset', '-i', default="holstep",
                         help='HDF5 file')
     parser.add_argument('--out', '-o',
@@ -43,7 +38,7 @@ def main():
 
     args = parser.parse_args()
 
-    device = chainer.get_device(args.device)
+    device = torch.device(args.device)
 
     print('# Device: {}'.format(str(device)))
     print('# conditional: {}'.format(args.conditional))
@@ -53,41 +48,54 @@ def main():
 
     test_h5f = h5py.File(args.dataset, 'r')
     test = formulanet.Dataset(symbols.symbols, test_h5f)
-    test_iter = iterators.SerialIterator(test, args.batchsize, repeat=False, shuffle=False)
+    test_loader = torch.utils.data.DataLoader(test, collate_fn=formulanet.convert, shuffle=False, batch_size=args.batchsize)
     print(len(test))
 
     model = formulanet.FormulaNet(vocab_size=len(symbols.symbols), steps=args.steps,
                                   order_preserving=args.preserve_order, conditional=args.conditional)
-    chainer.serializers.load_npz(args.model, model)
-    model.to_device(device)
+    model.load_state_dict(torch.load(args.model))
+    model.to(device)
 
-    with chainer.using_config('train', False):
-        with chainer.using_config('enable_backprop', False):
-            expected = []
-            logits = []
+    def output_transform(args):
+        y_pred, y = args
+        return y_pred[-len(y):], y
 
-            with tqdm(total=len(test)) as pbar:
-                for batch in test_iter:
-                    gs, tuples = formulanet.convert(batch, device)
-                    logits1, _loss = model._forward(gs, tuples)
-                    logits.append(chainer.backends.cuda.to_cpu(logits1.array))
-                    expected.extend(1 if y else 0 for (conj, stmt, y) in tuples)
-                    pbar.update(len(batch))
+    evaluator = ignite.engine.create_supervised_evaluator(
+        model,
+        metrics={
+            'accuracy': ignite.metrics.Accuracy(output_transform=output_transform),
+            'precision': ignite.metrics.Precision(output_transform=output_transform),
+            'recall': ignite.metrics.Recall(output_transform=output_transform),
+            'fbeta': ignite.metrics.Fbeta(output_transform=output_transform, beta=1.0),
+        },
+        device=device,
+        prepare_batch=formulanet.prepare_batch)
 
-            logits = np.concatenate(logits)
-            expected = np.array(expected, dtype=np.int32)
+    logits = []
+    expected = []
 
-            df = pd.DataFrame({"logits_false": logits[:, 0], "logits_true": logits[:, 1], "expected": expected})
-            df.to_csv(args.out, index=False)
+    @evaluator.on(ignite.engine.Events.ITERATION_COMPLETED)
+    def save_logits(engine):
+        y_pred, y = engine.state.output
+        y_pred = y_pred[-len(y):]
+        logits.append(y_pred.data.cpu().numpy())
+        expected.append(y.data.cpu().numpy())
 
-            accuracy = F.accuracy(logits, expected).array
-            precision, recall, F_beta_score, support = F.classification_summary(logits, expected)
-            print("accuracy: {}".format(accuracy))
-            print("precision: {}".format(precision.array[1]))
-            print("recall: {}".format(recall.array[1]))
-            print("F beta score: {}".format(F_beta_score.array[1]))
-            print("support: {}".format(support.array))
+    evaluator.run(test_loader)
 
+    logits = np.concatenate(logits)
+    expected = np.concatenate(expected)
+    n1 = np.sum(expected)
+    support = [len(test) - n1, n1]
+
+    df = pd.DataFrame({"logits_false": logits[:, 0], "logits_true": logits[:, 1], "expected": expected})
+    df.to_csv(args.out, index=False)
+
+    print("accuracy: {}".format(evaluator.state.metrics['accuracy']))
+    print("precision: {}".format(evaluator.state.metrics['precision'][1]))
+    print("recall: {}".format(evaluator.state.metrics['recall'][1]))
+    print("F beta score: {}".format(evaluator.state.metrics['fbeta']))
+    print("support: {}".format(support))
 
 if __name__ == '__main__':
     main()
